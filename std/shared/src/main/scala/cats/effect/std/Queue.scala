@@ -52,6 +52,8 @@ abstract class Queue[F[_], A] extends QueueSource[F, A] with QueueSink[F, A] { s
       def size: G[Int] = f(self.size)
       val take: G[A] = f(self.take)
       val tryTake: G[Option[A]] = f(self.tryTake)
+      val peek: G[A] = f(self.peek)
+      val tryPeek: G[Option[A]] = f(self.tryPeek)
     }
 }
 
@@ -76,7 +78,9 @@ object Queue {
    * when there are at least one taking fiber and at least one offering fiber
    * for `F` data types that are [[cats.effect.kernel.GenConcurrent]]. Both [[Queue#offer]] and
    * [[Queue#take]] semantically block until there is a fiber executing the
-   * opposite action, at which point both fibers are freed.
+   * opposite action, at which point both fibers are freed.  [[Queue#peek]]
+   * semantically blocks forever, while [[Queue#tryPeek]] returns `None`
+   * without blocking.
    *
    * @return a synchronous queue
    */
@@ -157,12 +161,14 @@ object Queue {
       F.deferred[Unit].flatMap { offerer =>
         F.uncancelable { poll =>
           state.modify {
-            case State(queue, size, takers, offerers) if takers.nonEmpty =>
+            case State(queue, size, takers, peekers, offerers) if takers.nonEmpty =>
               val (taker, rest) = takers.dequeue
-              State(queue, size, rest, offerers) -> taker.complete(a).void
+              State(queue, size, rest, Nil, offerers) ->
+                  peekers.traverse_(_.complete(a)) *> taker.complete(a).void
 
-            case State(queue, size, takers, offerers) if size < capacity =>
-              State(queue.enqueue(a), size + 1, takers, offerers) -> F.unit
+            case State(queue, size, takers, peekers, offerers) if size < capacity =>
+              State(queue.enqueue(a), size + 1, takers, Nil, offerers) ->
+                  peekers.traverse_(_.complete(a)) *> F.unit
 
             case s =>
               onOfferNoCapacity(s, a, offerer, poll)
@@ -173,12 +179,14 @@ object Queue {
     def tryOffer(a: A): F[Boolean] =
       state
         .modify {
-          case State(queue, size, takers, offerers) if takers.nonEmpty =>
+          case State(queue, size, takers, peekers, offerers) if takers.nonEmpty =>
             val (taker, rest) = takers.dequeue
-            State(queue, size, rest, offerers) -> taker.complete(a).as(true)
+            State(queue, size, rest, Nil, offerers) ->
+                peekers.traverse_(_.complete(a)) *> taker.complete(a).as(true)
 
-          case State(queue, size, takers, offerers) if size < capacity =>
-            State(queue.enqueue(a), size + 1, takers, offerers) -> F.pure(true)
+          case State(queue, size, takers, peekers, offerers) if size < capacity =>
+            State(queue.enqueue(a), size + 1, takers, Nil, offerers) ->
+                peekers.traverse_(_.complete(a)) *> F.pure(true)
 
           case s =>
             onTryOfferNoCapacity(s, a)
@@ -190,22 +198,22 @@ object Queue {
       F.deferred[A].flatMap { taker =>
         F.uncancelable { poll =>
           state.modify {
-            case State(queue, size, takers, offerers) if queue.nonEmpty && offerers.isEmpty =>
+            case State(queue, size, takers, peekers, offerers) if queue.nonEmpty && offerers.isEmpty =>
               val (a, rest) = queue.dequeue
-              State(rest, size - 1, takers, offerers) -> F.pure(a)
+              State(rest, size - 1, takers, peekers, offerers) -> F.pure(a)
 
-            case State(queue, size, takers, offerers) if queue.nonEmpty =>
+            case State(queue, size, takers, peekers, offerers) if queue.nonEmpty =>
               val (a, rest) = queue.dequeue
               val ((move, release), tail) = offerers.dequeue
-              State(rest.enqueue(move), size, takers, tail) -> release.complete(()).as(a)
+              State(rest.enqueue(move), size, takers, peekers, tail) -> release.complete(()).as(a)
 
-            case State(queue, size, takers, offerers) if offerers.nonEmpty =>
+            case State(queue, size, takers, peekers, offerers) if offerers.nonEmpty =>
               val ((a, release), rest) = offerers.dequeue
-              State(queue, size, takers, rest) -> release.complete(()).as(a)
+              State(queue, size, takers, peekers, rest) -> release.complete(()).as(a)
 
-            case State(queue, size, takers, offerers) =>
+            case State(queue, size, takers, peekers, offerers) =>
               val cleanup = state.update { s => s.copy(takers = s.takers.filter(_ ne taker)) }
-              State(queue, size, takers.enqueue(taker), offerers) ->
+              State(queue, size, takers.enqueue(taker), peekers, offerers) ->
                 poll(taker.get).onCancel(cleanup)
           }.flatten
         }
@@ -214,23 +222,44 @@ object Queue {
     val tryTake: F[Option[A]] =
       state
         .modify {
-          case State(queue, size, takers, offerers) if queue.nonEmpty && offerers.isEmpty =>
+          case State(queue, size, takers, peekers, offerers) if queue.nonEmpty && offerers.isEmpty =>
             val (a, rest) = queue.dequeue
-            State(rest, size - 1, takers, offerers) -> F.pure(a.some)
+            State(rest, size - 1, takers, peekers, offerers) -> F.pure(a.some)
 
-          case State(queue, size, takers, offerers) if queue.nonEmpty =>
+          case State(queue, size, takers, peekers, offerers) if queue.nonEmpty =>
             val (a, rest) = queue.dequeue
             val ((move, release), tail) = offerers.dequeue
-            State(rest.enqueue(move), size, takers, tail) -> release.complete(()).as(a.some)
+            State(rest.enqueue(move), size, takers, peekers, tail) -> release.complete(()).as(a.some)
 
-          case State(queue, size, takers, offerers) if offerers.nonEmpty =>
+          case State(queue, size, takers, peekers, offerers) if offerers.nonEmpty =>
             val ((a, release), rest) = offerers.dequeue
-            State(queue, size, takers, rest) -> release.complete(()).as(a.some)
+            State(queue, size, takers, peekers, rest) -> release.complete(()).as(a.some)
 
           case s =>
             s -> F.pure(none[A])
         }
         .flatten
+        .uncancelable
+
+    val peek: F[A] =
+      F.deferred[A].flatMap { peeker =>
+        F.uncancelable { poll =>
+          state.modify { st =>
+            st.queue.headOption match {
+              case Some(a) =>
+                st -> F.pure(a)
+
+              case None =>
+                val cleanup = state.update { s => s.copy(peekers = s.peekers.filter(_ ne peeker)) }
+                st.copy(peekers = peeker :: st.peekers) -> poll(peeker.get).onCancel(cleanup)
+            }
+          }.flatten
+        }
+      }
+
+    val tryPeek: F[Option[A]] =
+      state
+        .get.map(_.queue.headOption)
         .uncancelable
 
     def size: F[Int] = state.get.map(_.size)
@@ -247,9 +276,9 @@ object Queue {
         offerer: Deferred[F, Unit],
         poll: Poll[F]
     ): (State[F, A], F[Unit]) = {
-      val State(queue, size, takers, offerers) = s
+      val State(queue, size, takers, peekers, offerers) = s
       val cleanup = state.update { s => s.copy(offerers = s.offerers.filter(_._2 ne offerer)) }
-      State(queue, size, takers, offerers.enqueue(a -> offerer)) -> poll(offerer.get)
+      State(queue, size, takers, peekers, offerers.enqueue(a -> offerer)) -> poll(offerer.get)
         .onCancel(cleanup)
     }
 
@@ -290,9 +319,9 @@ object Queue {
     }
 
     protected def onTryOfferNoCapacity(s: State[F, A], a: A): (State[F, A], F[Boolean]) = {
-      val State(queue, size, takers, offerers) = s
+      val State(queue, size, takers, peekers, offerers) = s
       val (_, rest) = queue.dequeue
-      State(rest.enqueue(a), size, takers, offerers) -> F.pure(true)
+      State(rest.enqueue(a), size, takers, peekers, offerers) -> F.pure(true)
     }
 
   }
@@ -301,12 +330,13 @@ object Queue {
       queue: ScalaQueue[A],
       size: Int,
       takers: ScalaQueue[Deferred[F, A]],
+      peekers: List[Deferred[F, A]],
       offerers: ScalaQueue[(A, Deferred[F, Unit])]
   )
 
   private object State {
     def empty[F[_], A]: State[F, A] =
-      State(ScalaQueue.empty, 0, ScalaQueue.empty, ScalaQueue.empty)
+      State(ScalaQueue.empty, 0, ScalaQueue.empty, Nil, ScalaQueue.empty)
   }
 
   implicit def catsInvariantForQueue[F[_]: Functor]: Invariant[Queue[F, *]] =
@@ -323,6 +353,8 @@ object Queue {
             fa.tryTake.map(_.map(f))
           override def size: F[Int] =
             fa.size
+          override def peek: F[B] = fa.peek.map(f)
+          override def tryPeek: F[Option[B]] = fa.tryPeek.map(_.map(f))
         }
     }
 }
@@ -345,6 +377,22 @@ trait QueueSource[F[_], A] {
    */
   def tryTake: F[Option[A]]
 
+  /**
+   * Observes, without removing, an element from the front of the queue, possibly
+   * semantically blocking until an element becomes available.
+   */
+  def peek: F[A]
+
+  /**
+   * Attempts to observe, without removing, an element from the front of the queue,
+   * if one is available without semantically blocking.
+   *
+   * @return an effect that describes whether the observation of an element from
+   *         the queue succeeded without blocking, with `None` denoting that no
+   *         element was available
+   */
+  def tryPeek: F[Option[A]]
+
   def size: F[Int]
 }
 
@@ -358,6 +406,8 @@ object QueueSource {
           override def tryTake: F[Option[B]] = {
             fa.tryTake.map(_.map(f))
           }
+          override def peek: F[B] = fa.peek.map(f)
+          override def tryPeek: F[Option[B]] = fa.tryPeek.map(_.map(f))
           override def size: F[Int] =
             fa.size
         }

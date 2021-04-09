@@ -16,7 +16,7 @@
 
 package cats.effect.std
 
-import cats.{~>, Contravariant, Functor, Invariant}
+import cats.{Contravariant, Functor, Invariant, ~>}
 import cats.effect.kernel.{Deferred, GenConcurrent, Ref}
 import cats.effect.kernel.syntax.all._
 import cats.effect.std.internal.BankersQueue
@@ -45,10 +45,14 @@ trait Dequeue[F[_], A] extends Queue[F, A] with DequeueSource[F, A] with Dequeue
       def tryOfferBack(a: A): G[Boolean] = f(self.tryOfferBack(a))
       def takeBack: G[A] = f(self.takeBack)
       def tryTakeBack: G[Option[A]] = f(self.tryTakeBack)
+      def peekBack: G[A] = f(self.peekBack)
+      def tryPeekBack: G[Option[A]] = f(self.tryPeekBack)
       def offerFront(a: A): G[Unit] = f(self.offerFront(a))
       def tryOfferFront(a: A): G[Boolean] = f(self.tryOfferFront(a))
       def takeFront: G[A] = f(self.takeFront)
       def tryTakeFront: G[Option[A]] = f(self.tryTakeFront)
+      def peekFront: G[A] = f(self.peekFront)
+      def tryPeekFront: G[Option[A]] = f(self.tryPeekFront)
       def reverse: G[Unit] = f(self.reverse)
       def size: G[Int] = f(self.size)
     }
@@ -109,6 +113,18 @@ object Dequeue {
           override def tryOfferFront(b: B): F[Boolean] =
             fa.tryOfferFront(g(b))
 
+          override def peekBack: F[B] =
+            fa.peekBack.map(f)
+
+          override def tryPeekBack: F[Option[B]] =
+            fa.tryPeekBack.map(_.map(f))
+
+          override def peekFront: F[B] =
+            fa.peekFront.map(f)
+
+          override def tryPeekFront: F[Option[B]] =
+            fa.tryPeekFront.map(_.map(f))
+
           override def reverse: F[Unit] = fa.reverse
 
           override def size: F[Int] = fa.size
@@ -131,6 +147,12 @@ object Dequeue {
     override def tryTakeBack: F[Option[A]] =
       _tryTake(queue => queue.tryPopBack)
 
+    override def peekBack: F[A] =
+      _peek(queue => queue.tryPeekBack)
+
+    override def tryPeekBack: F[Option[A]] =
+      _tryPeek(queue => queue.tryPeekBack)
+
     override def offerFront(a: A): F[Unit] =
       _offer(a, queue => queue.pushFront(a))
 
@@ -143,29 +165,37 @@ object Dequeue {
     override def tryTakeFront: F[Option[A]] =
       _tryTake(queue => queue.tryPopFront)
 
+    override def peekFront: F[A] =
+      _peek(queue => queue.tryPeekFront)
+
+    override def tryPeekFront: F[Option[A]] =
+      _tryPeek(queue => queue.tryPeekFront)
+
     override def reverse: F[Unit] =
       state.update {
-        case State(queue, size, takers, offerers) =>
-          State(queue.reverse, size, takers, offerers)
+        case State(queue, size, takers, peekers, offerers) =>
+          State(queue.reverse, size, takers, peekers, offerers)
       }
 
     private def _offer(a: A, update: BankersQueue[A] => BankersQueue[A]): F[Unit] =
       F.deferred[Unit].flatMap { offerer =>
         F.uncancelable { poll =>
           state.modify {
-            case State(queue, size, takers, offerers) if takers.nonEmpty =>
+            case State(queue, size, takers, peekers, offerers) if takers.nonEmpty =>
               val (taker, rest) = takers.dequeue
-              State(queue, size, rest, offerers) -> taker.complete(a).void
+              State(queue, size, rest, Nil, offerers) ->
+                  peekers.traverse_(_.complete(a)) *> taker.complete(a).void
 
-            case State(queue, size, takers, offerers) if size < capacity =>
-              State(update(queue), size + 1, takers, offerers) -> F.unit
+            case State(queue, size, takers, peekers, offerers) if size < capacity =>
+              State(update(queue), size + 1, takers, Nil, offerers) ->
+                  peekers.traverse_(_.complete(a)) *> F.unit
 
             case s =>
-              val State(queue, size, takers, offerers) = s
+              val State(queue, size, takers, peekers, offerers) = s
               val cleanup = state.update { s =>
                 s.copy(offerers = s.offerers.filter(_._2 ne offerer))
               }
-              State(queue, size, takers, offerers.enqueue(a -> offerer)) -> poll(offerer.get)
+              State(queue, size, takers, peekers, offerers.enqueue(a -> offerer)) -> poll(offerer.get)
                 .onCancel(cleanup)
           }.flatten
         }
@@ -174,12 +204,14 @@ object Dequeue {
     private def _tryOffer(a: A, update: BankersQueue[A] => BankersQueue[A]) =
       state
         .modify {
-          case State(queue, size, takers, offerers) if takers.nonEmpty =>
+          case State(queue, size, takers, peekers, offerers) if takers.nonEmpty =>
             val (taker, rest) = takers.dequeue
-            State(queue, size, rest, offerers) -> taker.complete(a).as(true)
+            State(queue, size, rest, Nil, offerers) ->
+                peekers.traverse_(_.complete(a)) *> taker.complete(a).as(true)
 
-          case State(queue, size, takers, offerers) if size < capacity =>
-            State(update(queue), size + 1, takers, offerers) -> F.pure(true)
+          case State(queue, size, takers, peekers, offerers) if size < capacity =>
+            State(update(queue), size + 1, takers, Nil, offerers) ->
+                peekers.traverse_(_.complete(a)) *> F.pure(true)
 
           case s =>
             s -> F.pure(false)
@@ -191,24 +223,24 @@ object Dequeue {
       F.deferred[A].flatMap { taker =>
         F.uncancelable { poll =>
           state.modify {
-            case State(queue, size, takers, offerers) if queue.nonEmpty && offerers.isEmpty =>
+            case State(queue, size, takers, peekers, offerers) if queue.nonEmpty && offerers.isEmpty =>
               val (rest, ma) = dequeue(queue)
               val a = ma.get
-              State(rest, size - 1, takers, offerers) -> F.pure(a)
+              State(rest, size - 1, takers, peekers, offerers) -> F.pure(a)
 
-            case State(queue, size, takers, offerers) if queue.nonEmpty =>
+            case State(queue, size, takers, peekers, offerers) if queue.nonEmpty =>
               val (rest, ma) = dequeue(queue)
               val a = ma.get
               val ((move, release), tail) = offerers.dequeue
-              State(rest.pushBack(move), size, takers, tail) -> release.complete(()).as(a)
+              State(rest.pushBack(move), size, takers, peekers, tail) -> release.complete(()).as(a)
 
-            case State(queue, size, takers, offerers) if offerers.nonEmpty =>
+            case State(queue, size, takers, peekers, offerers) if offerers.nonEmpty =>
               val ((a, release), rest) = offerers.dequeue
-              State(queue, size, takers, rest) -> release.complete(()).as(a)
+              State(queue, size, takers, peekers, rest) -> release.complete(()).as(a)
 
-            case State(queue, size, takers, offerers) =>
+            case State(queue, size, takers, peekers, offerers) =>
               val cleanup = state.update { s => s.copy(takers = s.takers.filter(_ ne taker)) }
-              State(queue, size, takers.enqueue(taker), offerers) ->
+              State(queue, size, takers.enqueue(taker), peekers, offerers) ->
                 poll(taker.get).onCancel(cleanup)
           }.flatten
         }
@@ -218,22 +250,44 @@ object Dequeue {
         dequeue: BankersQueue[A] => (BankersQueue[A], Option[A])): F[Option[A]] =
       state
         .modify {
-          case State(queue, size, takers, offerers) if queue.nonEmpty && offerers.isEmpty =>
+          case State(queue, size, takers, peekers, offerers) if queue.nonEmpty && offerers.isEmpty =>
             val (rest, ma) = dequeue(queue)
-            State(rest, size - 1, takers, offerers) -> F.pure(ma)
+            State(rest, size - 1, takers, peekers, offerers) -> F.pure(ma)
 
-          case State(queue, size, takers, offerers) if queue.nonEmpty =>
+          case State(queue, size, takers, peekers, offerers) if queue.nonEmpty =>
             val (rest, ma) = dequeue(queue)
             val ((move, release), tail) = offerers.dequeue
-            State(rest.pushBack(move), size, takers, tail) -> release.complete(()).as(ma)
+            State(rest.pushBack(move), size, takers, peekers, tail) -> release.complete(()).as(ma)
 
-          case State(queue, size, takers, offerers) if offerers.nonEmpty =>
+          case State(queue, size, takers, peekers, offerers) if offerers.nonEmpty =>
             val ((a, release), rest) = offerers.dequeue
-            State(queue, size, takers, rest) -> release.complete(()).as(a.some)
+            State(queue, size, takers, peekers, rest) -> release.complete(()).as(a.some)
 
           case s =>
             s -> F.pure(none[A])
         }
+        .flatten
+        .uncancelable
+
+    private def _peek(headOption: BankersQueue[A] => Option[A]): F[A] =
+      F.deferred[A].flatMap { peeker =>
+        F.uncancelable { poll =>
+          state.modify { st =>
+            headOption(st.queue) match {
+              case Some(a) =>
+                st -> F.pure(a)
+
+              case None =>
+                val cleanup = state.update { s => s.copy(peekers = s.peekers.filter(_ ne peeker)) }
+                st.copy(peekers = peeker :: st.peekers) -> poll(peeker.get).onCancel(cleanup)
+            }
+          }.flatten
+        }
+      }
+
+    private def _tryPeek(headOption: BankersQueue[A] => Option[A]): F[Option[A]] =
+      state
+        .modify(st => st -> F.pure(headOption(st.queue)))
         .flatten
         .uncancelable
 
@@ -247,12 +301,13 @@ object Dequeue {
       queue: BankersQueue[A],
       size: Int,
       takers: ScalaQueue[Deferred[F, A]],
+      peekers: List[Deferred[F, A]],
       offerers: ScalaQueue[(A, Deferred[F, Unit])]
   )
 
   private[std] object State {
     def empty[F[_], A]: State[F, A] =
-      State(BankersQueue.empty, 0, ScalaQueue.empty, ScalaQueue.empty)
+      State(BankersQueue.empty, 0, ScalaQueue.empty, Nil, ScalaQueue.empty)
   }
 
 }
@@ -276,6 +331,21 @@ trait DequeueSource[F[_], A] extends QueueSource[F, A] {
   def tryTakeBack: F[Option[A]]
 
   /**
+   * Observes, without removing, an element from the back of the dequeue, possibly
+   * semantically blocking until an element becomes available.
+   */
+  def peekBack: F[A]
+
+  /**
+   * Attempts to observe, without removing, an element from the back of the dequeue,
+   * if one is available without semantically blocking.
+   *
+   * @return an effect that describes whether the observation of an element succeeded
+   *         without blocking, with `None` denoting that no element was available
+   */
+  def tryPeekBack: F[Option[A]]
+
+  /**
    * Dequeues an element from the front of the dequeue, possibly semantically
    * blocking until an element becomes available.
    */
@@ -292,6 +362,21 @@ trait DequeueSource[F[_], A] extends QueueSource[F, A] {
   def tryTakeFront: F[Option[A]]
 
   /**
+   * Observes, without removing, an element from the front of the dequeue, possibly
+   * semantically blocking until an element becomes available.
+   */
+  def peekFront: F[A]
+
+  /**
+   * Attempts to observe, without removing, an element from the front of the dequeue,
+   * if one is available without semantically blocking.
+   *
+   * @return an effect that describes whether the observation of an element succeeded
+   *         without blocking, with `None` denoting that no element was available
+   */
+  def tryPeekFront: F[Option[A]]
+
+  /**
    * Alias for takeFront in order to implement Queue
    */
   override def take: F[A] = takeFront
@@ -300,6 +385,10 @@ trait DequeueSource[F[_], A] extends QueueSource[F, A] {
    * Alias for tryTakeFront in order to implement Queue
    */
   override def tryTake: F[Option[A]] = tryTakeFront
+
+  override def peek: F[A] = peekFront
+
+  override def tryPeek: F[Option[A]] = tryPeekFront
 
 }
 
@@ -319,6 +408,18 @@ object DequeueSource {
 
           override def tryTakeFront: F[Option[B]] =
             fa.tryTakeFront.map(_.map(f))
+
+          override def peekBack: F[B] =
+            fa.peekBack.map(f)
+
+          override def tryPeekBack: F[Option[B]] =
+            fa.tryPeekBack.map(_.map(f))
+
+          override def peekFront: F[B] =
+            fa.peekFront.map(f)
+
+          override def tryPeekFront: F[Option[B]] =
+            fa.tryPeekFront.map(_.map(f))
 
           override def size: F[Int] =
             fa.size
