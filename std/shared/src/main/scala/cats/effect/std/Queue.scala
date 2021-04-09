@@ -249,6 +249,8 @@ object Queue {
               case Some(a) =>
                 st -> F.pure(a)
 
+              // Q: should a peek complete any blocked offerers?
+
               case None =>
                 val cleanup = state.update { s => s.copy(peekers = s.peekers.filter(_ ne peeker)) }
                 st.copy(peekers = peeker :: st.peekers) -> poll(peeker.get).onCancel(cleanup)

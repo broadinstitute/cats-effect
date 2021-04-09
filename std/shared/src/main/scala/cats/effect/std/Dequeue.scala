@@ -277,6 +277,8 @@ object Dequeue {
               case Some(a) =>
                 st -> F.pure(a)
 
+              // Q: should a peek complete any blocked offerers?
+
               case None =>
                 val cleanup = state.update { s => s.copy(peekers = s.peekers.filter(_ ne peeker)) }
                 st.copy(peekers = peeker :: st.peekers) -> poll(peeker.get).onCancel(cleanup)
@@ -287,8 +289,7 @@ object Dequeue {
 
     private def _tryPeek(headOption: BankersQueue[A] => Option[A]): F[Option[A]] =
       state
-        .modify(st => st -> F.pure(headOption(st.queue)))
-        .flatten
+        .get.map(st => headOption(st.queue))
         .uncancelable
 
     override def size: F[Int] = state.get.map(_.size)
